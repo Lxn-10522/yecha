@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>蛋小黑跑酷｜上传BGM版</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;font-family:system-ui}
+body{
+  background:#fff;
+  display:flex;
+  flex-direction:column;
+  align-items:center;
+  justify-content:center;
+  min-height:100vh;
+  gap:12px;
+}
+#gameCanvas{
+  border:2px solid #333;
+  background:#ffffff;
+}
+#tip{
+  color:#555;
+}
+#musicBtn{
+  padding:6px 14px;
+  font-size:15px;
+  cursor:pointer;
+}
+</style>
+</head>
+<body>
+<div>
+  <label>📷 上传蛋小黑图片：</label>
+  <input type="file" id="imgUpload" accept="image/png,image/jpg">
+
+  <label>🎵 上传BGM(mp3)：</label>
+  <input type="file" id="bgmUpload" accept="audio/mp3,audio/mpeg">
+
+  <button id="musicBtn">🎵 播放BGM</button>
+</div>
+<div id="score">分数：0</div>
+<canvas id="gameCanvas" width="800" height="220"></canvas>
+<div id="tip">空格 / 点击画布跳跃 | 撞到障碍物按空格重新开始</div>
+
+<script>
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+const imgUpload = document.getElementById('imgUpload');
+const bgmUpload = document.getElementById('bgmUpload');
+const musicBtn = document.getElementById('musicBtn');
+const scoreDom = document.getElementById('score');
+
+let eggImg = null;
+let bgm = null;
+let bgmPlaying = false;
+
+const egg = {
+  x: 50,
+  y: 130,
+  w: 80,
+  h: 80,
+  vy: 0,
+  isJump: false
+};
+
+const gravity = 0.9;
+const jumpPower = -14;
+const groundY = 140;
+let gameSpeed = 6;
+let score = 0;
+let gameOver = false;
+let obstacles = [];
+let frameId;
+let lastObstacleTime = 0;
+
+// 音频上下文：用来生成跳跃和死亡音效
+let audioCtx = null;
+
+function ensureAudio(){
+  if(!audioCtx){
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if(Ctx) audioCtx = new Ctx();
+  }
+  if(audioCtx && audioCtx.state === 'suspended'){
+    audioCtx.resume();
+  }
+}
+
+// 跳跃音效：轻快的“啵”
+function playJumpSound(){
+  if(!audioCtx) return;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = 'square';
+  osc.frequency.setValueAtTime(420, audioCtx.currentTime);
+  osc.frequency.exponentialRampToValueAtTime(880, audioCtx.currentTime + 0.08);
+  gain.gain.setValueAtTime(0.0001, audioCtx.currentTime);
+  gain.gain.exponentialRampToValueAtTime(0.25, audioCtx.currentTime + 0.02);
+  gain.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + 0.12);
+  osc.connect(gain);
+  gain.connect(audioCtx.destination);
+  osc.start();
+  osc.stop(audioCtx.currentTime + 0.14);
+}
+
+// 死亡音效：低沉的“咚”
+function playDieSound(){
+  if(!audioCtx) return;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = 'sawtooth';
+  osc.frequency.setValueAtTime(220, audioCtx.currentTime);
+  osc.frequency.exponentialRampToValueAtTime(60, audioCtx.currentTime + 0.35);
+  gain.gain.setValueAtTime(0.0001, audioCtx.currentTime);
+  gain.gain.exponentialRampToValueAtTime(0.3, audioCtx.currentTime + 0.02);
+  gain.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + 0.4);
+  osc.connect(gain);
+  gain.connect(audioCtx.destination);
+  osc.start();
+  osc.stop(audioCtx.currentTime + 0.42);
+}
+
+// 上传蛋小黑
+imgUpload.onchange = function(e){
+  const file = e.target.files[0];
+  if(!file) return;
+  eggImg = new Image();
+  eggImg.src = URL.createObjectURL(file);
+  eggImg.onload = ()=> startGame();
+}
+
+// 上传BGM
+bgmUpload.onchange = function(e){
+  const file = e.target.files[0];
+  if(!file) return;
+  bgm = new Audio(URL.createObjectURL(file));
+  bgm.loop = true;
+  bgm.volume = 0.3;
+  bgmPlaying = false;
+  musicBtn.innerText = "🎵 播放BGM";
+}
+
+// BGM播放/暂停
+musicBtn.onclick = ()=>{
+  ensureAudio();
+
+  if(!bgm){
+    alert("请先上传BGM音频文件！");
+    return;
+  }
+
+  if(bgmPlaying){
+    bgm.pause();
+    musicBtn.innerText = "🎵 播放BGM";
+    bgmPlaying = false;
+  }else{
+    bgm.play().catch(err=>{
+      alert("BGM播放失败：" + err.message);
+    });
+    musicBtn.innerText = "🔇 暂停BGM";
+    bgmPlaying = true;
+  }
+}
+
+function createObstacle(){
+  obstacles.push({
+    x: canvas.width,
+    w: 30,
+    h: 50
+  });
+}
+
+function hitTest(obs){
+  const shrink = 14;
+  const hitX = egg.x + shrink;
+  const hitY = egg.y + shrink;
+  const hitW = egg.w - shrink * 2;
+  const hitH = egg.h - shrink * 2;
+  return hitX < obs.x + obs.w &&
+         hitX + hitW > obs.x &&
+         hitY < groundY &&
+         hitY + hitH > groundY - obs.h;
+}
+
+function loop(timestamp){
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  ctx.beginPath();
+  ctx.moveTo(0, groundY);
+  ctx.lineTo(canvas.width, groundY);
+  ctx.strokeStyle = "#222";
+  ctx.lineWidth = 2;
+  ctx.stroke();
+
+  if(eggImg){
+    ctx.drawImage(eggImg, egg.x, egg.y, egg.w, egg.h);
+  }else{
+    ctx.fillStyle = "#aaa";
+    ctx.fillText("请先上传蛋小黑图片", 300, 100);
+  }
+
+  if(egg.isJump){
+    egg.vy += gravity;
+    egg.y += egg.vy;
+    if(egg.y >= groundY - egg.h){
+      egg.y = groundY - egg.h;
+      egg.isJump = false;
+      egg.vy = 0;
+    }
+  }
+
+  for(let i = obstacles.length - 1; i >= 0; i--){
+    const o = obstacles[i];
+    o.x -= gameSpeed;
+    ctx.fillStyle = "#222";
+    ctx.fillRect(o.x, groundY - o.h, o.w, o.h);
+
+    if(hitTest(o)){
+      gameOver = true;
+      playDieSound();
+      cancelAnimationFrame(frameId);
+      alert(`游戏结束！得分：${score}\n按空格重新开始`);
+      return;
+    }
+
+    if(o.x + o.w < 0){
+      obstacles.splice(i, 1);
+      score += 1;
+      scoreDom.innerText = "分数：" + score;
+      if(score % 8 === 0) gameSpeed += 0.25;
+    }
+  }
+
+  if(timestamp - lastObstacleTime > 750 && Math.random() < 0.022){
+    createObstacle();
+    lastObstacleTime = timestamp;
+  }
+
+  frameId = requestAnimationFrame(loop);
+}
+
+function jump(){
+  if(gameOver || egg.isJump || !eggImg) return;
+  ensureAudio();
+  egg.isJump = true;
+  egg.vy = jumpPower;
+  playJumpSound();
+}
+
+function restart(){
+  obstacles = [];
+  score = 0;
+  gameSpeed = 6;
+  gameOver = false;
+  egg.y = groundY - egg.h;
+  egg.vy = 0;
+  egg.isJump = false;
+  scoreDom.innerText = "分数：0";
+  lastObstacleTime = 0;
+  loop(0);
+}
+
+document.addEventListener('keydown', e=>{
+  if(e.code === 'Space' || e.code === 'ArrowUp'){
+    e.preventDefault();
+    if(gameOver){
+      restart();
+    }else{
+      jump();
+    }
+  }
+});
+
+canvas.onclick = ()=>{
+  if(gameOver){
+    restart();
+  }else{
+    jump();
+  }
+};
+
+function startGame(){
+  cancelAnimationFrame(frameId);
+  restart();
+}
+</script>
+</body>
+</html>
